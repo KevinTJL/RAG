@@ -1,0 +1,14 @@
+[Unit]
+Description=RAG FastAPI backend
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rag
+EnvironmentFile=/opt/rag/.env.production
+ExecStart=/opt/rag/.venv/bin/uvicorn app.api:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local RAG</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f4f6f8; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; }
+      main { width: min(720px, calc(100vw - 40px)); background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 32px; box-shadow: 0 20px 50px rgba(15, 23, 42, .08); }
+      h1 { margin-top: 0; }
+      code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
+      a { color: #2563eb; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Local RAG 前端已迁移</h1>
+      <p>新的前端位于 <code>frontend/</code>，使用 Vue 3 + Vite + TypeScript。</p>
+      <p>启动后端：</p>
+      <pre><code>uvicorn app.api:app --host 0.0.0.0 --port 8000</code></pre>
+      <p>启动前端：</p>
+      <pre><code>cd frontend
+npm install
+npm run dev</code></pre>
+      <p>访问 <a href="http://127.0.0.1:5173">http://127.0.0.1:5173</a></p>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Local RAG 知识库问答系统</title>
+    <!-- 引入 TailwindCSS及其排版插件 -->
+    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
+    <!-- 引入 Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- 引入 Marked.js 用于解析 Markdown -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- 引入 KaTeX 用于渲染数学公式 -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css" crossorigin="anonymous">
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+</head>
+<body class="bg-gray-100 h-screen font-sans">
+    <div id="app" class="flex h-full">
+        
+        <!-- 左侧边栏：知识库管理 -->
+        <div class="w-80 bg-white border-r border-gray-200 p-5 flex flex-col">
+            <h2 class="text-xl font-bold mb-6 text-gray-800">📚 机器学习知识库</h2>
+            
+            <div class="mb-6">
+                <label class="block text-sm font-medium text-gray-700 mb-2">1. 导入新文档</label>
+                <input type="file" ref="fileInput" accept=".pdf,.md,.txt" class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer" />
+                <button @click="uploadFile" :disabled="uploading || ingesting" class="mt-3 w-full bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 disabled:opacity-50">
+                    {{ uploading ? '上传中...' : (ingesting ? '系统正在更新知识库...' : '确认上传文件并更新') }}
+                </button>
+            </div>
+
+            <!-- 文件列表 -->
+            <div class="flex-1 overflow-y-auto mt-2 mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-2 border-b pb-2">📂 已存文档</label>
+                <div v-if="files.length === 0" class="text-xs text-gray-400 italic">知识库当前为空</div>
+                <ul v-else class="space-y-2">
+                    <li v-for="file in files" :key="file" class="text-sm bg-gray-50 p-2 rounded border border-gray-200 flex justify-between items-center group">
+                        <span class="truncate block w-4/5 text-gray-600" :title="file">{{ file }}</span>
+                        <button @click="deleteFile(file)" class="text-red-400 hover:text-red-600 font-bold opacity-0 group-hover:opacity-100 transition-opacity" title="删除文档" :disabled="deleting === file">
+                            <span v-if="deleting === file" class="text-xs">...</span>
+                            <span v-else>删除</span>
+                        </button>
+                    </li>
+                </ul>
+            </div>
+
+            <div class="mt-auto pt-4 text-xs text-gray-400">
+                后续我们可以在此扩展图谱可视化入口 🚀
+            </div>
+        </div>
+
+        <!-- 侧边栏右侧主区：对话问答 -->
+        <div class="flex-1 flex flex-col items-center p-6 overflow-hidden">
+            <div class="w-full max-w-4xl bg-white shadow-lg rounded-xl flex flex-col h-full border border-gray-200">
+                
+                <!-- 聊天记录区域 -->
+                <div class="flex-1 overflow-y-auto p-6 space-y-6 bg-gray-50 rounded-t-xl" ref="chatBox">
+                    <div v-if="messages.length === 0" class="text-center text-gray-400 mt-20">
+                        <span class="text-4xl block mb-4">💬</span>
+                        知识库已就绪，向我提问吧！
+                    </div>
+
+                    <div v-for="(msg, index) in messages" :key="index" :class="msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
+                        <div class="max-w-[80%] rounded-lg p-4" :class="msg.role === 'user' ? 'bg-blue-500 text-white' : 'bg-white border shadow-sm text-gray-800'">
+                            <!-- 使用 v-html 和 tailwind typography (prose) 渲染 Markdown -->
+                            <div v-html="renderMarkdown(msg.content)" class="prose prose-sm max-w-none math-container" :class="msg.role === 'user' ? 'prose-invert' : ''"></div>
+                            
+                            <!-- 机器人的溯源分块（折叠面板） -->
+                            <div v-if="msg.role === 'bot' && msg.chunks && msg.chunks.length > 0" class="mt-4 pt-4 border-t border-gray-200">
+                                <details class="text-sm">
+                                    <summary class="cursor-pointer text-blue-600 hover:text-blue-800 font-medium">📋 查看引用的参考文档分块 ({{ msg.chunks.length }} 块)</summary>
+                                    <div class="mt-3 space-y-3">
+                                        <div v-for="(chunk, idx) in msg.chunks" :key="idx" class="p-3 bg-gray-50 rounded border border-gray-200 text-xs text-gray-600">
+                                            <div class="font-bold text-gray-800 mb-1">
+                                                📄 {{ chunk.source }} <span v-if="chunk.page > 0">| 第 {{ chunk.page }} 页</span> 
+                                                <span class="text-gray-400 font-normal ml-2">相关度距即: {{ chunk.distance }}</span>
+                                            </div>
+                                            <!-- 使用相同的 markdown 和 katex 渲染逻辑处理分块文本 -->
+                                            <div v-html="renderMarkdown(chunk.text)" class="prose prose-sm max-w-none text-xs leading-relaxed math-container"></div>
+                                        </div>
+                                    </div>
+                                </details>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-if="answering" class="flex justify-start">
+                        <div class="bg-gray-200 rounded-lg p-4 animate-pulse text-gray-600">AI 思考检索中...</div>
+                    </div>
+                </div>
+
+                <!-- 底部输入框 -->
+                <div class="p-4 bg-white border-t border-gray-200 rounded-b-xl flex gap-3">
+                    <input v-model="questionInput" @keyup.enter="sendMessage" type="text" placeholder="向知识库提相关的疑问..." class="flex-1 border bg-gray-50 border-gray-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    <button @click="sendMessage" :disabled="answering || !questionInput.trim()" class="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 disabled:opacity-50 font-medium">
+                        发送
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const { createApp } = Vue;
+        // 注意：如果你后端运行在别的端口，修改这里的 baseURL
+        // 将 API 地址改为您的本机局域网 IP，这样外部设备才能把请求发给这台 Mac
+        const API_URL = "http://10.192.89.119:8000";
+
+        createApp({
+            data() {
+                return {
+                    messages: [],
+                    files: [],
+                    questionInput: '',
+                    answering: false,
+                    uploading: false,
+                    ingesting: false,
+                    deleting: null
+                }
+            },
+            mounted() {
+                this.fetchFiles();
+            },
+            methods: {
+                async fetchFiles() {
+                    try {
+                        const res = await fetch(`${API_URL}/api/files`);
+                        if (res.ok) {
+                            const data = await res.json();
+                            this.files = data.files || [];
+                        }
+                    } catch (e) {
+                        console.error("无法获取文件列表:", e);
+                    }
+                },
+                async deleteFile(filename) {
+                    if (!confirm(`确定要删除 ${filename} 吗？删除后系统将自动重建知识库。`)) return;
+                    this.deleting = filename;
+                    this.ingesting = true; // 复用 ingesting 状态以禁用其它操作并给出反馈
+                    try {
+                        const res = await fetch(`${API_URL}/api/files/${encodeURIComponent(filename)}`, { method: "DELETE" });
+                        const data = await res.json();
+                        alert(`✅ ${data.message}`);
+                        await this.fetchFiles();
+                    } catch (e) {
+                        alert("删除失败: " + e.message);
+                    } finally {
+                        this.deleting = null;
+                        this.ingesting = false;
+                    }
+                },
+                // 使用 marked 将 markdown 文本解析为 HTML
+                renderMarkdown(text) {
+                    if (!text) return '';
+                    return marked.parse(text);
+                },
+                // 每次 DOM 更新后，渲染数学公式
+                renderMathInElement() {
+                    this.$nextTick(() => {
+                        const containers = document.querySelectorAll('.math-container');
+                        containers.forEach(container => {
+                            renderMathInElement(container, {
+                                delimiters: [
+                                    {left: '$$', right: '$$', display: true},
+                                    {left: '$', right: '$', display: false},
+                                    {left: '\\(', right: '\\)', display: false},
+                                    {left: '\\[', right: '\\]', display: true}
+                                ],
+                                throwOnError: false
+                            });
+                        });
+                    });
+                },
+                async uploadFile() {
+                    const fileInput = this.$refs.fileInput;
+                    if (!fileInput.files.length) return alert("请先选择文件");
+                    
+                    const file = fileInput.files[0];
+                    const formData = new FormData();
+                    formData.append("file", file);
+                    
+                    this.uploading = true;
+                    try {
+                        const res = await fetch(`${API_URL}/api/upload`, { method: "POST", body: formData });
+                        const data = await res.json();
+                        fileInput.value = ""; // 清空
+                        // 上传成功后，不再弹窗打断用户，直接触发知识库更新
+                        this.triggerIngest(data.message);
+                    } catch (e) {
+                        alert("上传失败: " + e.message);
+                    } finally {
+                        this.uploading = false;
+                    }
+                },
+                async triggerIngest(uploadMsg = "") {
+                    this.ingesting = true;
+                    try {
+                        const res = await fetch(`${API_URL}/api/ingest`, { method: "POST" });
+                        const data = await res.json();
+                        let successMsg = uploadMsg ? `${uploadMsg}\n✅ ${data.message}` : `✅ ${data.message}`;
+                        alert(successMsg);
+                        await this.fetchFiles(); // 更新文件列表
+                    } catch (e) {
+                        alert("构建失败: " + e.message);
+                    } finally {
+                        this.ingesting = false;
+                    }
+                },
+                async sendMessage() {
+                    const q = this.questionInput.trim();
+                    if (!q) return;
+                    
+                    this.messages.push({ role: 'user', content: q });
+                    this.questionInput = '';
+                    this.answering = true;
+                    this.scrollToBottom();
+
+                    try {
+                        const res = await fetch(`${API_URL}/api/query`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ question: q })
+                        });
+                        if (!res.ok) throw new Error("API 请求异常");
+                        const data = await res.json();
+                        
+                        this.messages.push({
+                            role: 'bot',
+                            content: data.answer,
+                            chunks: data.chunks
+                        });
+                        this.renderMathInElement(); // 渲染模型回复中的公式
+                    } catch (e) {
+                        this.messages.push({ role: 'bot', content: "抱歉，检索或遇到错误：" + e.message });
+                    } finally {
+                        this.answering = false;
+                        this.scrollToBottom();
+                    }
+                },
+                scrollToBottom() {
+                    this.$nextTick(() => {
+                        const box = this.$refs.chatBox;
+                        box.scrollTop = box.scrollHeight;
+                    });
+                }
+            }
+        }).mount('#app')
+    </script>
+</body>
+</html>

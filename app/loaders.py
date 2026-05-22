@@ -5,6 +5,8 @@ from typing import Iterable
 
 from pypdf import PdfReader
 
+from app.text_utils import read_text_safely
+
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 
 
@@ -15,7 +17,7 @@ def iter_supported_files(data_dir: Path) -> Iterable[Path]:
 
 
 def load_text_file(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="ignore")
+    return read_text_safely(path)
 
 
 def load_pdf_file(path: Path) -> list[tuple[int, str]]:

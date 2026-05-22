@@ -1,7 +1,18 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Iterable
+
+
+def read_text_safely(file_path: Path) -> str:
+    raw = file_path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def clean_text(text: str) -> str:

@@ -19,6 +19,7 @@ from app.learning_profile import adjust_concept_weakness, set_concept_weakness, 
 from app.ollama_client import OllamaClient
 from app.profile_store import ProfileStore, safe_user_id
 from app.review_store import ReviewStore, now_iso as review_now_iso
+from app.text_utils import read_text_safely
 from app.vector_store import delete_user_memory_collection, get_collection, get_user_memory_collection
 from app.ingest import delete_file_records, index_file, main as ingest_main
 
@@ -1078,7 +1079,7 @@ async def preview_file(filename: str, scope: str = "personal", user: AuthUser = 
         return {
             "filename": file_path.name,
             "type": suffix.lstrip("."),
-            "content": file_path.read_text(encoding="utf-8", errors="ignore"),
+            "content": read_text_safely(file_path),
         }
     if suffix == ".pdf":
         return {
@@ -1095,7 +1096,8 @@ async def raw_file(filename: str, scope: str = "personal", user: AuthUser = Depe
     if scope not in {"system", "personal"}:
         raise HTTPException(status_code=400, detail="非法知识库范围")
     file_path = safe_data_file(filename, user.id, scope=scope)
-    return FileResponse(str(file_path), filename=file_path.name)
+    media_type = "application/pdf" if file_path.suffix.lower() == ".pdf" else None
+    return FileResponse(str(file_path), filename=file_path.name, media_type=media_type)
 
 
 @app.get("/api/profile/{user_id}")

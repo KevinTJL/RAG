@@ -39,7 +39,12 @@ async function render() {
 }
 
 async function load() {
-  pdfDoc = await (pdfjsLib as any).getDocument(props.url).promise;
+  pdfDoc = await (pdfjsLib as any).getDocument({
+    url: props.url,
+    cMapUrl: '/pdfjs/cmaps/',
+    cMapPacked: true,
+    standardFontDataUrl: '/pdfjs/standard_fonts/',
+  }).promise;
   pageCount.value = pdfDoc.numPages;
   page.value = Math.min(Math.max(props.initialPage || 1, 1), pageCount.value);
   targetPage.value = page.value;

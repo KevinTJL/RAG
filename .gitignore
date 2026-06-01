@@ -1,6 +1,6 @@
 .DS_Store
 
-# Local secrets
+# Local secrets / credentials — NEVER commit
 .env
 .env.*
 !.env.example
@@ -19,11 +19,26 @@ __pycache__/
 frontend/node_modules/
 frontend/dist/
 
-# Runtime data
+# Runtime data (incl. user credentials, API keys, profiles, vector DB)
 logs/
+*.log
 db/
 data/users/
 
-# Keep small demo markdown files if desired, but avoid committing large/licensed PDFs.
+# Large binaries
+rag-deploy.tar.gz
+*.bak
+
+# Temp / test artifacts
+_test_*
+_query*
+
+# Thesis / private — never commit
+_docwork/
+assets/
+outputs/
+论文插图_drawio/
+
+# Keep small demo markdown files, but avoid committing large/licensed PDFs.
 data/raw/*.pdf
 data/raw/.DS_Store

@@ -108,7 +108,7 @@ class ReviewStore:
             answers.pop(str(delete_index), None)
             session["answers"] = answers
 
-            scored_steps = [step for step in next_steps if step.get("type") in {"question", "quiz"}]
+            scored_steps = [step for step in next_steps if step.get("type") in {"question", "quiz", "blank", "fill_blank"}]
             correct_count = sum(1 for item in answers.values() if item.get("is_correct"))
             session["score"] = round(correct_count / max(1, len(scored_steps)), 2)
             session["updated_at"] = now_iso()

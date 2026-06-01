@@ -1,0 +1,19 @@
+name: rag
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - chromadb>=1.5.0
+  - fastapi>=0.115.0
+  - uvicorn[standard]>=0.30.0
+  - pydantic>=2.7.0
+  - pypdf>=5.0.0
+  - python-dotenv>=1.0.1
+  - python-multipart>=0.0.9
+  - requests>=2.32.0
+  - cryptography>=42.0.0
+  - networkx>=3.2.0
+  - pip:
+    - openai>=1.0.0

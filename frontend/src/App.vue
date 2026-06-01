@@ -25,6 +25,7 @@
         <RouterLink to="/knowledge">知识库</RouterLink>
         <RouterLink to="/review">学习计划</RouterLink>
         <RouterLink to="/learning-history">学习历史</RouterLink>
+        <RouterLink to="/settings">用户设置</RouterLink>
         <button class="nav-logout" type="button" @click="logout">退出登录</button>
       </nav>
     </aside>
@@ -35,25 +36,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watchEffect } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { ref } from 'vue';
 import { authStore } from './authStore';
-import { hasSeenGuide } from './onboarding';
 
 const user = authStore.user;
 const loading = authStore.loading;
 const error = authStore.error;
-const route = useRoute();
-const router = useRouter();
 const email = ref('');
 const password = ref('');
 const authMode = ref<'login' | 'register'>('login');
-
-watchEffect(() => {
-  if (user.value && !hasSeenGuide(user.value) && route.path !== '/guide') {
-    router.replace('/guide');
-  }
-});
 
 function toggleMode() {
   error.value = '';

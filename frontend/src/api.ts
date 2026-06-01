@@ -47,6 +47,27 @@ export function getUserId() {
 }
 
 export type KnowledgeScope = 'system' | 'personal';
+export type SearchScope = 'all' | 'personal' | 'system';
+export type SelectedFile = { scope: KnowledgeScope; source: string };
+
+export type UserSettings = {
+  top_k: number;
+  deepseek_thinking_enabled: boolean;
+  deepseek_thinking: Record<string, boolean>;
+  search_scope: SearchScope;
+  selected_files: SelectedFile[];
+  custom_openai: {
+    base_url: string;
+    model_name: string;
+    temperature?: number | null;
+    top_p?: number | null;
+    max_tokens?: number | null;
+    timeout?: number | null;
+    enabled_for_chat: boolean;
+    enabled_for_review: boolean;
+    has_api_key: boolean;
+  };
+};
 
 export const api = {
   register: (body: { email: string; password: string }) =>
@@ -63,6 +84,14 @@ export const api = {
     }),
   me: () => request<{ user: AuthUser }>('/api/auth/me'),
   models: () => request<{ default_chat_model: string; chat_models: string[]; embed_model: string }>('/api/models'),
+  settings: () => request<{ settings: UserSettings }>('/api/settings'),
+  updateSettings: (body: any) =>
+    request<{ settings: UserSettings }>('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  testOpenAISettings: () => request<{ message: string; preview: string }>('/api/settings/test-openai', { method: 'POST' }),
   files: () => request<{ files: string[]; personal_files: string[]; system_files: string[]; data_dir?: string; system_data_dir?: string }>('/api/files'),
   upload: (file: File) => {
     const form = new FormData();

@@ -1,18 +1,5 @@
 # app/api.py
-"""
-FastAPI 后端接口入口文件。
-
-本文件承担毕业设计 RAG 系统的“统一 API 层”职责，主要负责：
-1. 启动 FastAPI 应用并配置跨域访问；
-2. 提供用户注册、登录和当前用户身份校验接口；
-3. 管理用户上传的课程资料、知识库文件预览与增量索引；
-4. 提供学习画像、薄弱知识点、复习计划和答题判分相关接口；
-5. 实现核心 RAG 问答流程：查询重写 -> 核心知识点抽取 -> 向量检索 -> 构造上下文 -> 调用大模型生成回答 -> 更新学习画像。
-
-说明：本文件偏“接口编排层”，底层的用户认证、向量库、文档解析、画像更新和模型调用等细节
-分别封装在 app.auth、app.vector_store、app.ingest、app.learning_profile、app.ollama_client 等模块中。
-"""
-
+import asyncio
 import json
 import os
 import re
@@ -23,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from typing import Optional, List
+from typing import Any, Literal, Optional, List
 from pydantic import BaseModel
 
 from app.auth import AuthStore, AuthUser
@@ -34,25 +21,19 @@ from app.ollama_client import OllamaClient
 from app.profile_store import ProfileStore, safe_user_id
 from app.review_store import ReviewStore, now_iso as review_now_iso
 from app.text_utils import read_text_safely
+from app.user_settings_store import UserSettingsStore
 from app.vector_store import delete_user_memory_collection, get_collection, get_user_memory_collection
 from app.ingest import delete_file_records, index_file, main as ingest_main
 
-# -----------------------------
-# 全局应用对象与持久化存储对象
-# -----------------------------
-# FastAPI 实例是整个后端服务的入口；下面几个 Store 对象分别负责用户画像、复习记录和认证数据的读写。
 app = FastAPI(title="Local RAG API")
 profile_store = ProfileStore()
 review_store = ReviewStore()
 auth_store = AuthStore()
-
-# 内置可选聊天模型。最终可用模型 = settings.available_chat_models + 这里定义的内置模型。
+settings_store = UserSettingsStore()
 BUILTIN_CHAT_MODELS = ("qwen2.5:3b", "deepseek-v4-pro", "deepseek-v4-flash")
+MAX_QUERY_TOP_K = 8
+CUSTOM_MODEL_PREFIX = "custom-openai:"
 
-# -----------------------------
-# 推荐追问解析与清洗相关正则
-# -----------------------------
-# 大模型有时会把“推荐追问”附在正文末尾，本组规则用于识别标题、列表项以及过滤模板化占位句。
 FOLLOWUP_HEADING_PATTERN = re.compile(r"^\s*#{1,6}\s*推荐追问\s*$", re.MULTILINE)
 FOLLOWUP_ITEM_PATTERN = re.compile(r"^\s*(?:\d+[.)]|[-*])\s*(.+?)\s*$")
 FOLLOWUP_PLACEHOLDER_PATTERNS = (
@@ -68,17 +49,106 @@ FOLLOWUP_PLACEHOLDER_PATTERNS = (
 
 
 def available_chat_models() -> tuple[str, ...]:
-    """返回当前后端允许调用的聊天模型列表，并用 dict 去重保持顺序。"""
     return tuple(dict.fromkeys([*settings.available_chat_models, *BUILTIN_CHAT_MODELS]))
 
 
 def is_allowed_chat_model(model: str) -> bool:
-    """检查前端传入的模型名是否在白名单中，防止调用不存在或未配置的模型。"""
-    return model in available_chat_models()
+    return model in available_chat_models() or model.startswith(CUSTOM_MODEL_PREFIX)
+
+
+def custom_model_name(user_settings: dict[str, Any]) -> str:
+    model_name = str(user_settings.get("custom_openai", {}).get("model_name") or "").strip()
+    return f"{CUSTOM_MODEL_PREFIX}{model_name}" if model_name else ""
+
+
+def custom_openai_config(user_id: str, user_settings: dict[str, Any]) -> dict[str, Any] | None:
+    custom = dict(user_settings.get("custom_openai", {}) if isinstance(user_settings.get("custom_openai"), dict) else {})
+    api_key = settings_store.get_custom_api_key(user_id)
+    if not api_key or not custom.get("base_url") or not custom.get("model_name"):
+        return None
+    custom["api_key"] = api_key
+    return custom
+
+
+def resolve_chat_options(
+    user_id: str,
+    chat_model: str | None,
+    custom_model_enabled: bool = False,
+    custom_module: Literal["chat", "review"] = "chat",
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    user_settings = settings_store.load_private(user_id)
+    custom = user_settings.get("custom_openai", {}) if isinstance(user_settings.get("custom_openai"), dict) else {}
+    custom_enabled_by_settings = bool(custom.get("enabled_for_chat" if custom_module == "chat" else "enabled_for_review"))
+    custom_name = custom_model_name(user_settings)
+    requested = (chat_model or "").strip()
+    use_custom = (custom_model_enabled or custom_enabled_by_settings or requested.startswith(CUSTOM_MODEL_PREFIX)) and bool(custom_name)
+    model = custom_name if use_custom else (requested or settings.chat_model)
+    if not is_allowed_chat_model(model):
+        raise HTTPException(status_code=400, detail=f"不支持的聊天模型：{model}")
+    config = custom_openai_config(user_id, user_settings) if model.startswith(CUSTOM_MODEL_PREFIX) else None
+    if model.startswith(CUSTOM_MODEL_PREFIX) and not config:
+        raise HTTPException(status_code=400, detail="自定义 OpenAI API 模型缺少必填配置或 API key")
+    return model, user_settings, config
+
+
+def get_deepseek_thinking(user_settings: dict[str, Any], model: str) -> bool:
+    """Per-model deepseek thinking toggle with fallback:
+    1. per-model setting: user_settings.deepseek_thinking[model]
+    2. per-user global: user_settings.deepseek_thinking_enabled
+    3. system default: settings.deepseek_thinking_enabled
+    """
+    per_model = user_settings.get("deepseek_thinking", {})
+    if isinstance(per_model, dict) and model in per_model:
+        return bool(per_model[model])
+    return bool(user_settings.get("deepseek_thinking_enabled", settings.deepseek_thinking_enabled))
+
+
+def chat_with_options(
+    ollama: OllamaClient,
+    messages: list[dict[str, str]],
+    model: str,
+    user_settings: dict[str, Any],
+    custom_config: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+) -> str:
+    return ollama.chat(
+        messages,
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        deepseek_thinking_enabled=get_deepseek_thinking(user_settings, model),
+        custom_openai=custom_config,
+    )
+
+
+def query_top_k(request: Any, user_settings: dict[str, Any]) -> int:
+    raw = request.top_k if request.top_k is not None else user_settings.get("top_k", settings.top_k)
+    try:
+        return max(1, min(MAX_QUERY_TOP_K, int(raw or settings.top_k or 4)))
+    except Exception:
+        return max(1, min(MAX_QUERY_TOP_K, int(settings.top_k or 4)))
+
+
+def selected_sources_for_scope(selected_files: list[dict[str, str]], scope: str) -> list[str]:
+    sources: list[str] = []
+    for item in selected_files or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("scope") == scope and str(item.get("source", "")).strip():
+            sources.append(str(item.get("source")).strip())
+    return sorted(set(sources))
+
+
+def chroma_source_filter(sources: list[str]) -> dict[str, Any] | None:
+    if not sources:
+        return None
+    if len(sources) == 1:
+        return {"source": sources[0]}
+    return {"source": {"$in": sources}}
 
 
 def infer_followup_topic(question: str, core_terms: list[str] | None = None) -> str:
-    """根据核心术语或原始问题推断推荐追问的主题词。"""
     if core_terms:
         selected = [term.strip() for term in core_terms if term.strip()]
         if selected:
@@ -88,7 +158,6 @@ def infer_followup_topic(question: str, core_terms: list[str] | None = None) -> 
 
 
 def default_followups(question: str, core_terms: list[str] | None = None) -> list[str]:
-    """当模型没有生成有效追问时，提供一组兜底追问，保证前端始终有可展示内容。"""
     topic = infer_followup_topic(question, core_terms)
     return [
         "这样解释清楚了吗？需要换一种方式或举例再讲一遍吗？",
@@ -98,12 +167,10 @@ def default_followups(question: str, core_terms: list[str] | None = None) -> lis
 
 
 def is_placeholder_followup(question: str) -> bool:
-    """判断追问是否为提示词模板或占位句，而不是真正可点击的问题。"""
     return any(pattern in question for pattern in FOLLOWUP_PLACEHOLDER_PATTERNS)
 
 
 def clean_followups(questions: list[str]) -> list[str]:
-    """统一清洗追问文本，过滤空文本、模板化问题，并最多保留 3 条。"""
     cleaned: list[str] = []
     for question in questions:
         normalized = normalize_followup_text(question)
@@ -116,7 +183,6 @@ def clean_followups(questions: list[str]) -> list[str]:
 
 
 def normalize_followup_text(question: str) -> str:
-    """去除追问前后的多余标点、引号、JSON 外壳等噪声。"""
     normalized = question.strip()
     previous = None
 
@@ -139,13 +205,7 @@ def normalize_followup_text(question: str) -> str:
 
 
 def split_answer_and_followups(answer: str, question: str) -> tuple[str, list[str], bool]:
-    """从模型回答中拆分正文与“推荐追问”部分。
-
-    返回值：
-    - answer_body：去掉追问后的回答正文；
-    - followups：解析出的追问列表；
-    - extracted_followups：是否真的在回答中识别到了追问区域。
-    """
+    """Split the model's fixed follow-up section from the answer body."""
     fallback = default_followups(question)
     match = FOLLOWUP_HEADING_PATTERN.search(answer)
     if not match:
@@ -172,10 +232,7 @@ def split_answer_and_followups(answer: str, question: str) -> tuple[str, list[st
 
 
 def parse_followup_response(text: str) -> list[str]:
-    """解析模型生成的推荐追问。
-
-    优先尝试读取 JSON 数组；如果模型没有严格输出 JSON，则退化为解析编号列表或项目符号列表。
-    """
+    """Parse follow-up questions from JSON first, then from numbered/bulleted text."""
     cleaned = text.strip()
 
     try:
@@ -203,7 +260,6 @@ def parse_followup_response(text: str) -> list[str]:
 
 
 def flatten_string_items(value) -> list[str]:
-    """把模型可能返回的字符串、列表、字典递归展开为字符串列表。"""
     items: list[str] = []
 
     if isinstance(value, str):
@@ -235,7 +291,6 @@ def flatten_string_items(value) -> list[str]:
 
 
 def parse_core_terms_response(text: str) -> list[str]:
-    """解析“核心知识点抽取”模型输出，支持 JSON 数组和逗号/顿号分隔文本两种形式。"""
     cleaned = text.strip()
 
     try:
@@ -258,8 +313,13 @@ def parse_core_terms_response(text: str) -> list[str]:
     return terms
 
 
-def extract_core_terms(ollama: OllamaClient, question: str, model: str | None = None) -> list[str]:
-    """调用大模型从用户问题中提取检索关键词，用于提升向量检索召回质量。"""
+def extract_core_terms(
+    ollama: OllamaClient,
+    question: str,
+    model: str | None = None,
+    user_settings: dict[str, Any] | None = None,
+    custom_config: dict[str, Any] | None = None,
+) -> list[str]:
     prompt = f"""请从下面的问题中提取用于知识库检索的核心知识点。
 
 要求：
@@ -271,19 +331,32 @@ def extract_core_terms(ollama: OllamaClient, question: str, model: str | None = 
 问题：{question}
 
 JSON数组："""
-    response = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.1)
+    response = chat_with_options(
+        ollama,
+        [{"role": "user", "content": prompt}],
+        model or settings.chat_model,
+        user_settings or settings_store.load_private("default"),
+        custom_config,
+        temperature=0.1,
+    )
     return parse_core_terms_response(response)
 
 
 def build_retrieval_query(question: str, core_terms: list[str]) -> str:
-    """将原问题和核心知识点拼接为检索查询，帮助 embedding 更突出关键概念。"""
     if not core_terms:
         return question
     return f"{question}\n核心知识点：{'、'.join(core_terms)}"
 
 
-def generate_followups(ollama: OllamaClient, question: str, answer: str, core_terms: list[str] | None = None, model: str | None = None) -> list[str]:
-    """基于当前问答内容额外生成 3 个推荐追问，增强系统的学习引导能力。"""
+def generate_followups(
+    ollama: OllamaClient,
+    question: str,
+    answer: str,
+    core_terms: list[str] | None = None,
+    model: str | None = None,
+    user_settings: dict[str, Any] | None = None,
+    custom_config: dict[str, Any] | None = None,
+) -> list[str]:
     topic = infer_followup_topic(question, core_terms)
     prompt = f"""请基于用户问题、主题关键词和助手回答，生成正好3个适合用户继续追问的问题。
 
@@ -303,7 +376,14 @@ def generate_followups(ollama: OllamaClient, question: str, answer: str, core_te
 助手回答：{answer}
 
 JSON数组："""
-    response = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.2)
+    response = chat_with_options(
+        ollama,
+        [{"role": "user", "content": prompt}],
+        model or settings.chat_model,
+        user_settings or settings_store.load_private("default"),
+        custom_config,
+        temperature=0.2,
+    )
     return parse_followup_response(response)
 
 
@@ -314,8 +394,9 @@ def repair_followups(
     core_terms: list[str],
     current_followups: list[str],
     model: str | None = None,
+    user_settings: dict[str, Any] | None = None,
+    custom_config: dict[str, Any] | None = None,
 ) -> list[str]:
-    """当推荐追问数量不足或过于模板化时，再调用模型做一次修复。"""
     topic = infer_followup_topic(question, core_terms)
     prompt = f"""请把下面的推荐追问修复为正好3个自然、具体、可点击的中文问题。
 
@@ -332,14 +413,16 @@ def repair_followups(
 当前追问：{json.dumps(current_followups, ensure_ascii=False)}
 
 JSON数组："""
-    response = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.15)
+    response = chat_with_options(
+        ollama,
+        [{"role": "user", "content": prompt}],
+        model or settings.chat_model,
+        user_settings or settings_store.load_private("default"),
+        custom_config,
+        temperature=0.15,
+    )
     return parse_followup_response(response)
 
-
-# -----------------------------
-# CORS 配置
-# -----------------------------
-# 前端页面可能由本地静态页面、开发服务器或部署域名访问，因此这里允许配置文件中的来源跨域调用 API。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
@@ -351,7 +434,6 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def healthcheck():
-    """健康检查接口，用于确认后端、模型配置和 embedding 模型配置是否正常。"""
     return {
         "status": "ok",
         "app_env": settings.app_env,
@@ -362,24 +444,22 @@ async def healthcheck():
 
 @app.get("/")
 async def root():
-    """返回前端入口页面。部署为单页应用时，访问根路径即可打开系统界面。"""
     return FileResponse("index.html")
 
-
-# -----------------------------
-# 请求体模型定义
-# -----------------------------
-# Pydantic 模型用于描述前端请求 JSON 的结构，同时自动完成基础字段校验。
 class MessageItem(BaseModel):
     role: str
     content: str
-
 
 class QueryRequest(BaseModel):
     question: str
     user_id: str = "default"
     history: List[MessageItem] = []
     chat_model: Optional[str] = None
+    top_k: Optional[int] = None
+    search_scope: Literal["all", "personal", "system"] = "all"
+    selected_files: list[dict[str, str]] = []
+    deepseek_thinking_enabled: Optional[bool] = None
+    custom_model_enabled: bool = False
 
 
 class ReviewPlanRequest(BaseModel):
@@ -389,6 +469,30 @@ class ReviewPlanRequest(BaseModel):
     difficulty: Optional[int] = None
     mode: str = "topic"
     chat_model: Optional[str] = None
+    deepseek_thinking_enabled: Optional[bool] = None
+    custom_model_enabled: bool = False
+
+
+class CustomOpenAISettings(BaseModel):
+    api_key: Optional[str] = None
+    clear_api_key: bool = False
+    base_url: str = "https://api.openai.com/v1"
+    model_name: str = ""
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    max_tokens: Optional[int] = None
+    timeout: Optional[int] = None
+    enabled_for_chat: bool = False
+    enabled_for_review: bool = False
+
+
+class UserSettingsRequest(BaseModel):
+    top_k: Optional[int] = None
+    deepseek_thinking_enabled: Optional[bool] = None
+    deepseek_thinking: Optional[dict[str, bool]] = None
+    search_scope: Literal["all", "personal", "system"] = "all"
+    selected_files: list[dict[str, str]] = []
+    custom_openai: Optional[CustomOpenAISettings] = None
 
 
 class ReviewAnswerRequest(BaseModel):
@@ -410,14 +514,12 @@ class WeaknessUpdateRequest(BaseModel):
     reason: str = ""
 
 
-# 复习试卷采用 1~5 级难度；薄弱度默认起始值用于首次标记薄弱概念。
 MIN_DIFFICULTY = 1
 MAX_DIFFICULTY = 5
 WEAKNESS_START_SCORE = 0.6
 
 
 def clamp_difficulty(value: int | float | str | None) -> int:
-    """将任意输入规整到 1~5 的合法难度区间。"""
     try:
         level = int(value or MIN_DIFFICULTY)
     except Exception:
@@ -426,7 +528,6 @@ def clamp_difficulty(value: int | float | str | None) -> int:
 
 
 def difficulty_from_weakness(score: float | int | str | None) -> int:
-    """根据薄弱度分数推导初始试卷难度；薄弱度越高，起始难度越低。"""
     try:
         weakness = max(0.0, min(1.0, float(score or 0.0)))
     except Exception:
@@ -443,7 +544,6 @@ def difficulty_from_weakness(score: float | int | str | None) -> int:
 
 
 def next_difficulty_from_correct_count(current: int, correct_count: int) -> int:
-    """根据 5 道题的答对数量决定下一套题是否升/降难度。"""
     current = clamp_difficulty(current)
     if correct_count >= 4:
         return clamp_difficulty(current + 1)
@@ -453,7 +553,6 @@ def next_difficulty_from_correct_count(current: int, correct_count: int) -> int:
 
 
 def paper_result_label(correct_count: int) -> str:
-    """把答对数量转成试卷结果标签，便于前端展示和画像更新。"""
     if correct_count >= 4:
         return "excellent"
     if correct_count == 3:
@@ -472,7 +571,6 @@ class AuthRequest(BaseModel):
 
 
 def normalize_chat_role(role: str) -> str:
-    """将前端或历史记录中的角色名转换为 OpenAI/Ollama 常见消息角色。"""
     normalized = role.strip().lower()
     if normalized == "bot":
         return "assistant"
@@ -482,7 +580,6 @@ def normalize_chat_role(role: str) -> str:
 
 
 def current_user(authorization: Optional[str] = Header(default=None), access_token: Optional[str] = None) -> AuthUser:
-    """FastAPI 依赖函数：从 Authorization Bearer 或 access_token 中解析当前登录用户。"""
     token = access_token or ""
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
@@ -495,24 +592,20 @@ def current_user(authorization: Optional[str] = Header(default=None), access_tok
 
 
 def assert_user_access(user_id: str, user: AuthUser) -> None:
-    """确保请求中的 user_id 与当前登录用户一致，避免越权访问其他用户数据。"""
     if safe_user_id(user_id) != safe_user_id(user.id):
         raise HTTPException(status_code=403, detail="无权访问该用户数据")
 
 
 def data_dir_for_user(user_id: str) -> Path:
-    """返回用户私有知识库资料目录。"""
     return settings.user_data_root / safe_user_id(user_id)
 
 
 def public_data_dir() -> Path:
-    """返回系统公共知识库资料目录。"""
     return settings.data_dir
 
 
 @app.post("/api/auth/register")
 async def register(request: AuthRequest):
-    """用户注册接口。注册成功后直接签发 token，前端可立即进入系统。"""
     try:
         user = auth_store.create_user(request.email, request.password)
     except ValueError as e:
@@ -522,7 +615,6 @@ async def register(request: AuthRequest):
 
 @app.post("/api/auth/login")
 async def login(request: AuthRequest):
-    """用户登录接口。邮箱和密码验证通过后返回访问 token。"""
     user = auth_store.authenticate(request.email, request.password)
     if not user:
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
@@ -531,22 +623,56 @@ async def login(request: AuthRequest):
 
 @app.get("/api/auth/me")
 async def me(user: AuthUser = Depends(current_user)):
-    """返回当前 token 对应的用户信息，常用于前端刷新页面后的登录态恢复。"""
     return {"user": {"id": user.id, "email": user.email}}
 
 
 @app.get("/api/models")
-async def list_models():
-    """返回前端可选择的聊天模型和当前 embedding 模型。"""
+async def list_models(user: AuthUser = Depends(current_user)):
+    models = list(available_chat_models())
+    user_settings = settings_store.load_public(user.id)
+    custom_name = custom_model_name(user_settings)
+    if custom_name:
+        models.append(custom_name)
     return {
         "default_chat_model": settings.chat_model,
-        "chat_models": list(available_chat_models()),
+        "chat_models": list(dict.fromkeys(models)),
         "embed_model": settings.embed_model,
     }
 
 
+@app.get("/api/settings")
+async def get_user_settings(user: AuthUser = Depends(current_user)):
+    return {"settings": settings_store.load_public(user.id)}
+
+
+@app.put("/api/settings")
+async def update_user_settings(request: UserSettingsRequest, user: AuthUser = Depends(current_user)):
+    payload = request.model_dump(exclude_none=False)
+    if payload.get("top_k") is not None:
+        payload["top_k"] = max(1, min(MAX_QUERY_TOP_K, int(payload["top_k"])))
+    settings_payload = settings_store.save(user.id, payload)
+    return {"settings": settings_payload}
+
+
+@app.post("/api/settings/test-openai")
+async def test_custom_openai(user: AuthUser = Depends(current_user)):
+    user_settings = settings_store.load_private(user.id)
+    config = custom_openai_config(user.id, user_settings)
+    if not config:
+        raise HTTPException(status_code=400, detail="请先填写并保存 OpenAI API key、base_url 和模型名称")
+    try:
+        content = OllamaClient(timeout=int(config.get("timeout") or 30)).chat(
+            [{"role": "user", "content": "Reply with OK."}],
+            model=custom_model_name(user_settings),
+            custom_openai=config,
+            temperature=0,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OpenAI API 测试失败：{e}") from e
+    return {"message": "OpenAI API 测试成功", "preview": content[:120]}
+
+
 def get_all_user_memories(collection, limit: int = 12) -> list[str]:
-    """读取用户长期记忆库中的若干条文本，用于学习状态分析。"""
     try:
         total = collection.count()
         if total <= 0:
@@ -558,7 +684,6 @@ def get_all_user_memories(collection, limit: int = 12) -> list[str]:
 
 
 def clean_abstract_evaluation(text: str) -> str:
-    """清洗大模型生成的学习状态短评，限制长度并去除多余符号。"""
     cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
     cleaned = cleaned.strip("\"'`，,。 \t\n")
     if not cleaned:
@@ -569,7 +694,6 @@ def clean_abstract_evaluation(text: str) -> str:
 
 
 def fallback_abstract_evaluation(profile: dict, question: str) -> str:
-    """当模型短评生成失败时，根据画像数据生成保守的兜底评价。"""
     recent_questions = profile.get("recent_questions") if isinstance(profile.get("recent_questions"), list) else []
     weak_items = profile.get("concept_mastery") if isinstance(profile.get("concept_mastery"), dict) else {}
     active_weak = [
@@ -590,8 +714,9 @@ def generate_abstract_evaluation(
     profile: dict,
     question: str,
     model: str | None = None,
+    user_settings: dict[str, Any] | None = None,
+    custom_config: dict[str, Any] | None = None,
 ) -> str:
-    """调用大模型生成一句学习状态抽象评价，用于画像面板展示。"""
     recent_questions = [
         item.get("question", "")
         for item in profile.get("recent_questions", [])
@@ -631,16 +756,22 @@ def generate_abstract_evaluation(
 当前问题：
 {question}
 
-一句话评价："""
+    一句话评价："""
     try:
-        raw = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.2)
+        raw = chat_with_options(
+            ollama,
+            [{"role": "user", "content": prompt}],
+            model or settings.chat_model,
+            user_settings or settings_store.load_private("default"),
+            custom_config,
+            temperature=0.2,
+        )
     except Exception:
         return fallback_abstract_evaluation(profile, question)
     return clean_abstract_evaluation(raw) or fallback_abstract_evaluation(profile, question)
 
 
 def safe_data_file(filename: str, user_id: str, scope: str = "personal") -> Path:
-    """安全地定位知识库文件，防止通过 ../ 等路径访问目录外文件。"""
     root_dir = public_data_dir() if scope == "system" else data_dir_for_user(user_id)
     target = (root_dir / filename).resolve()
     root = root_dir.resolve()
@@ -652,7 +783,6 @@ def safe_data_file(filename: str, user_id: str, scope: str = "personal") -> Path
 
 
 def parse_json_object(text: str) -> dict:
-    """从模型输出中截取并解析 JSON 对象，失败时返回空字典。"""
     start = text.find("{")
     end = text.rfind("}") + 1
     if start == -1 or end <= start:
@@ -665,10 +795,6 @@ def parse_json_object(text: str) -> dict:
 
 
 def remove_profile_tag(profile: dict, category: str, value: str) -> dict:
-    """从学习画像中删除指定类别的标签或条目。
-
-    不同 category 对应画像中的不同字段，例如 concept_mastery、knowledge_gaps、misconceptions 等。
-    """
     category = category.strip()
     value = value.strip()
     if not value:
@@ -730,12 +856,7 @@ def remove_profile_tag(profile: dict, category: str, value: str) -> dict:
     return profile
 
 
-# -----------------------------
-# 复习计划默认题目与题目规范化工具
-# -----------------------------
-# 当大模型输出格式不稳定或题目不足时，下面的默认题目可以保证前端复习模块仍能正常工作。
 def default_quiz_step(topic: str, index: int, difficulty: int = 1) -> dict:
-    """生成一道默认单选题。"""
     difficulty = clamp_difficulty(difficulty)
     questions = [
         (
@@ -782,7 +903,6 @@ def default_quiz_step(topic: str, index: int, difficulty: int = 1) -> dict:
 
 
 def default_blank_step(topic: str, index: int, difficulty: int = 1) -> dict:
-    """生成一道默认填空题。"""
     difficulty = clamp_difficulty(difficulty)
     return {
         "id": f"blank-{index}",
@@ -796,14 +916,12 @@ def default_blank_step(topic: str, index: int, difficulty: int = 1) -> dict:
 
 
 def default_practice_step(topic: str, index: int, difficulty: int = 1) -> dict:
-    """按题号生成默认练习题，混合单选题和填空题。"""
     if index in {2, 5}:
         return default_blank_step(topic, index, difficulty)
     return default_quiz_step(topic, index, difficulty)
 
 
 def default_review_plan(topic: str, difficulty: int = 1) -> dict:
-    """生成完整默认复习计划：1 个讲解步骤 + 5 道练习题。"""
     difficulty = clamp_difficulty(difficulty)
     return {
         "topic": topic,
@@ -822,27 +940,23 @@ def default_review_plan(topic: str, difficulty: int = 1) -> dict:
 
 
 def extract_labeled_options(text: str) -> list[str]:
-    """从一段文本中提取 A./B./C./D. 等格式的选项。"""
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     matches = re.finditer(r"(?:^|\s)([A-H])[.、．]\s*(.*?)(?=\s+[A-H][.、．]\s*|$)", normalized)
     return [f"{match.group(1)}. {match.group(2).strip()}" for match in matches if match.group(2).strip()]
 
 
 def strip_inline_options(text: str) -> str:
-    """如果题干中混入了选项，则只保留选项前面的题干部分。"""
     raw = str(text or "")
     match = re.search(r"(?:^|\s)[A-H][.、．]\s*", raw)
     return raw[: match.start()].strip() if match and match.start() > 0 else raw.strip()
 
 
 def option_label(option: str) -> str:
-    """提取选项标签，例如从 'A. xxx' 中提取 'A'。"""
     match = re.match(r"\s*([A-H])(?:[.、．]|\s*$)", str(option or ""))
     return match.group(1) if match else ""
 
 
 def split_review_options(options, question: str = "") -> list[str]:
-    """规范化试卷选项，解决模型把多个选项塞进一个字符串的问题。"""
     if not isinstance(options, list):
         options = [options] if options else []
 
@@ -872,7 +986,6 @@ def split_review_options(options, question: str = "") -> list[str]:
 
 
 def normalize_question_text(text: str) -> str:
-    """归一化题目文本，用于判断两道题是否语义或字面重复。"""
     normalized = str(text or "").lower()
     normalized = re.sub(r"[a-h][.、．]", "", normalized)
     normalized = re.sub(r"[\s，。！？、；：,.!?;:\"'`“”‘’（）()【】\[\]{}<>《》]+", "", normalized)
@@ -880,7 +993,6 @@ def normalize_question_text(text: str) -> str:
 
 
 def review_step_question_text(step: dict) -> str:
-    """拼接复习步骤中的标题、题干和选项，形成用于去重的完整题目文本。"""
     if not isinstance(step, dict):
         return ""
     parts = [
@@ -894,7 +1006,6 @@ def review_step_question_text(step: dict) -> str:
 
 
 def are_similar_questions(left: str, right: str, threshold: float = 0.82) -> bool:
-    """使用字符串相似度判断两道题是否重复或高度相似。"""
     left_norm = normalize_question_text(left)
     right_norm = normalize_question_text(right)
     if not left_norm or not right_norm:
@@ -906,7 +1017,7 @@ def are_similar_questions(left: str, right: str, threshold: float = 0.82) -> boo
 
 
 def collect_review_questions(user_id: str, topic: str | None = None, limit: int = 80) -> list[str]:
-    """收集用户历史复习题，用于生成下一套试卷时避免重复。"""
+    """Collect recent generated questions so the next paper can avoid repeats."""
     questions: list[str] = []
     normalized_topic = normalize_question_text(topic or "")
     for session in review_store.load_all(user_id):
@@ -933,7 +1044,6 @@ def collect_review_questions(user_id: str, topic: str | None = None, limit: int 
 
 
 def is_duplicate_review_step(step: dict, selected_steps: list[dict], forbidden_questions: list[str]) -> bool:
-    """判断候选练习题是否与已选题目或历史题目重复。"""
     question = review_step_question_text(step)
     if not question:
         return True
@@ -953,10 +1063,6 @@ def normalize_review_plan(
     difficulty: int = 1,
     forbidden_questions: list[str] | None = None,
 ) -> dict:
-    """规范化模型生成的复习计划。
-
-    主要处理：缺少 explain 步骤、题目数量不足、选项格式错误、答案不是完整选项、题目重复等问题。
-    """
     difficulty = clamp_difficulty(difficulty)
     if not isinstance(plan, dict):
         return default_review_plan(topic, difficulty)
@@ -1037,8 +1143,9 @@ def generate_comprehensive_review_plan(
     difficulty: int = 1,
     model: str | None = None,
     forbidden_questions: list[str] | None = None,
+    user_settings: dict[str, Any] | None = None,
+    custom_config: dict[str, Any] | None = None,
 ) -> dict:
-    """根据完整学习画像生成综合复习试卷。"""
     topic = "综合学习画像试卷"
     forbidden_questions = forbidden_questions or []
     prompt = f"""请根据用户学习画像生成一张综合试卷，只输出JSON对象。
@@ -1069,7 +1176,14 @@ JSON格式同：
     {{"id": "blank-2", "type": "blank", "title": "第 2 题", "question": "填空题", "answer": "标准答案", "accepted_answers": ["标准答案"], "explanation": "解释"}}
   ]
 }}"""
-    raw = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.2)
+    raw = chat_with_options(
+        ollama,
+        [{"role": "user", "content": prompt}],
+        model or settings.chat_model,
+        user_settings or settings_store.load_private("default"),
+        custom_config,
+        temperature=0.2,
+    )
     plan = parse_json_object(raw) or default_review_plan(topic, difficulty)
     return normalize_review_plan(plan, topic, difficulty, forbidden_questions=forbidden_questions)
 
@@ -1080,8 +1194,9 @@ def generate_review_plan(
     difficulty: int = 1,
     model: str | None = None,
     forbidden_questions: list[str] | None = None,
+    user_settings: dict[str, Any] | None = None,
+    custom_config: dict[str, Any] | None = None,
 ) -> dict:
-    """根据指定主题生成专题复习试卷。"""
     forbidden_questions = forbidden_questions or []
     prompt = f"""请根据用户给定主题和要求生成一张学习试卷，只输出JSON对象。
 
@@ -1116,20 +1231,20 @@ JSON格式：
     {{"id": "blank-8", "type": "blank", "title": "第 8 题", "question": "填空题", "answer": "标准答案", "accepted_answers": ["标准答案", "近义答案"], "explanation": "解释"}}
   ]
 }}"""
-    raw = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.2)
+    raw = chat_with_options(
+        ollama,
+        [{"role": "user", "content": prompt}],
+        model or settings.chat_model,
+        user_settings or settings_store.load_private("default"),
+        custom_config,
+        temperature=0.2,
+    )
     plan = parse_json_object(raw) or default_review_plan(topic, difficulty)
     return normalize_review_plan(plan, topic, difficulty, forbidden_questions=forbidden_questions)
 
-
-# -----------------------------
-# 知识库文件管理接口
-# -----------------------------
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...), user: AuthUser = Depends(current_user)):
-    """上传知识文档到当前用户目录，并对该文件执行增量索引。
-
-    仅允许 txt、md、pdf 三类课程资料格式；上传成功后立即调用 index_file 写入向量库。
-    """
+    """上传知识文档到指定目录，并只索引该文件"""
     user_data_dir = data_dir_for_user(user.id)
     user_data_dir.mkdir(parents=True, exist_ok=True)
     
@@ -1141,7 +1256,7 @@ async def upload_file(file: UploadFile = File(...), user: AuthUser = Depends(cur
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        indexed_chunks = index_file(file_path, user_id=user.id)
+        indexed_chunks = await asyncio.to_thread(index_file, file_path, None, user.id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件已上传，但增量索引失败：{e}")
 
@@ -1151,10 +1266,9 @@ async def upload_file(file: UploadFile = File(...), user: AuthUser = Depends(cur
         "indexed_chunks": indexed_chunks,
     }
 
-
 @app.get("/api/files")
 async def list_files(user: AuthUser = Depends(current_user)):
-    """列出公共知识库文件和当前用户的个人知识库文件。"""
+    """列出知识库中的所有文件"""
     system_files: list[str] = []
     if public_data_dir().exists():
         system_files = [
@@ -1183,10 +1297,7 @@ async def list_files(user: AuthUser = Depends(current_user)):
 
 @app.get("/api/files/{filename}/preview")
 async def preview_file(filename: str, scope: str = "personal", user: AuthUser = Depends(current_user)):
-    """返回知识库文件预览信息。
-
-    文本类文件直接返回文本内容；PDF 文件返回 raw_url，由前端通过 PDF.js 渲染。
-    """
+    """返回知识库文件预览信息。PDF 由前端通过 raw_url 使用 PDF.js 渲染。"""
     if scope not in {"system", "personal"}:
         raise HTTPException(status_code=400, detail="非法知识库范围")
     file_path = safe_data_file(filename, user.id, scope=scope)
@@ -1208,7 +1319,7 @@ async def preview_file(filename: str, scope: str = "personal", user: AuthUser = 
 
 @app.get("/api/files/{filename}/raw")
 async def raw_file(filename: str, scope: str = "personal", user: AuthUser = Depends(current_user)):
-    """返回知识库原文件，供前端下载、预览或 PDF.js 渲染。"""
+    """返回知识库原文件，供前端预览或 PDF.js 渲染。"""
     if scope not in {"system", "personal"}:
         raise HTTPException(status_code=400, detail="非法知识库范围")
     file_path = safe_data_file(filename, user.id, scope=scope)
@@ -1216,12 +1327,9 @@ async def raw_file(filename: str, scope: str = "personal", user: AuthUser = Depe
     return FileResponse(str(file_path), filename=file_path.name, media_type=media_type)
 
 
-# -----------------------------
-# 学习画像与历史数据接口
-# -----------------------------
 @app.get("/api/profile/{user_id}")
 async def get_learning_profile(user_id: str, user: AuthUser = Depends(current_user)):
-    """返回当前用户的结构化学习画像。"""
+    """返回当前用户的结构化学习画像"""
     assert_user_access(user_id, user)
     return {"profile": profile_store.load(user_id)}
 
@@ -1238,7 +1346,7 @@ async def delete_profile_tag(user_id: str, request: ProfileTagDeleteRequest, use
 
 @app.delete("/api/user/{user_id}/history")
 async def clear_user_history(user_id: str, user: AuthUser = Depends(current_user)):
-    """清除当前用户的问答长期记忆和学习画像；前端聊天记录由浏览器本地清除。"""
+    """清除当前用户的长期记忆和学习画像；前端聊天记录由浏览器本地清除。"""
     assert_user_access(user_id, user)
     delete_user_memory_collection(user_id)
     profile = profile_store.clear(user_id)
@@ -1247,7 +1355,7 @@ async def clear_user_history(user_id: str, user: AuthUser = Depends(current_user
 
 @app.delete("/api/user/{user_id}/all-history")
 async def clear_all_user_history(user_id: str, user: AuthUser = Depends(current_user)):
-    """清除当前用户所有历史数据，但保留已经上传和构建的知识库。"""
+    """清除当前用户所有历史数据，但不清空知识库。"""
     assert_user_access(user_id, user)
     delete_user_memory_collection(user_id)
     profile = profile_store.clear(user_id)
@@ -1255,12 +1363,8 @@ async def clear_all_user_history(user_id: str, user: AuthUser = Depends(current_
     return {"message": "已清空问答历史、用户画像、学习计划和学习历史，知识库未受影响", "profile": profile}
 
 
-# -----------------------------
-# 复习计划接口
-# -----------------------------
 @app.get("/api/review/history/{user_id}")
 async def get_review_history(user_id: str, user: AuthUser = Depends(current_user)):
-    """读取用户历史复习计划，并自动修复题目数量不足的旧记录。"""
     assert_user_access(user_id, user)
     sessions = review_store.load_all(user_id)
     changed = False
@@ -1288,7 +1392,6 @@ async def get_review_history(user_id: str, user: AuthUser = Depends(current_user
 
 @app.delete("/api/review/{user_id}/{session_id}")
 async def delete_review_session(user_id: str, session_id: str, user: AuthUser = Depends(current_user)):
-    """删除指定复习计划。"""
     assert_user_access(user_id, user)
     deleted = review_store.delete(user_id, session_id)
     if not deleted:
@@ -1298,7 +1401,6 @@ async def delete_review_session(user_id: str, session_id: str, user: AuthUser = 
 
 @app.delete("/api/review/{user_id}/{session_id}/steps/{step_key}")
 async def delete_review_step(user_id: str, session_id: str, step_key: str, user: AuthUser = Depends(current_user)):
-    """删除复习计划中的某个步骤或题目。"""
     assert_user_access(user_id, user)
     updated = review_store.delete_step(user_id, session_id, step_key)
     if not updated:
@@ -1308,20 +1410,22 @@ async def delete_review_step(user_id: str, session_id: str, step_key: str, user:
 
 @app.post("/api/review/plan")
 async def create_review_plan(request: ReviewPlanRequest, user: AuthUser = Depends(current_user)):
-    """创建新的复习计划。
-
-    mode=topic 时按指定主题出题；mode=comprehensive 时根据学习画像生成综合试卷。
-    """
     assert_user_access(request.user_id, user)
-    chat_model = (request.chat_model or settings.chat_model).strip()
-    if not is_allowed_chat_model(chat_model):
-        raise HTTPException(status_code=400, detail=f"不支持的聊天模型：{chat_model}")
+    chat_model, user_settings, custom_config = resolve_chat_options(
+        user.id,
+        request.chat_model,
+        custom_model_enabled=request.custom_model_enabled,
+        custom_module="review",
+    )
+    if request.deepseek_thinking_enabled is not None:
+        user_settings = {**user_settings, "deepseek_thinking_enabled": request.deepseek_thinking_enabled}
 
     ollama = OllamaClient()
-    try:
-        ollama.healthcheck()
-    except Exception:
-        raise HTTPException(status_code=503, detail="Ollama 未启动或不可用")
+    if not chat_model.startswith(CUSTOM_MODEL_PREFIX):
+        try:
+            ollama.healthcheck()
+        except Exception:
+            raise HTTPException(status_code=503, detail="Ollama 未启动或不可用")
 
     difficulty = (
         clamp_difficulty(request.difficulty)
@@ -1339,6 +1443,8 @@ async def create_review_plan(request: ReviewPlanRequest, user: AuthUser = Depend
             difficulty,
             model=chat_model,
             forbidden_questions=forbidden_questions,
+            user_settings=user_settings,
+            custom_config=custom_config,
         )
     else:
         topic = request.topic
@@ -1349,6 +1455,8 @@ async def create_review_plan(request: ReviewPlanRequest, user: AuthUser = Depend
             difficulty,
             model=chat_model,
             forbidden_questions=forbidden_questions,
+            user_settings=user_settings,
+            custom_config=custom_config,
         )
     session = review_store.add(
         request.user_id,
@@ -1370,10 +1478,6 @@ async def create_review_plan(request: ReviewPlanRequest, user: AuthUser = Depend
 
 @app.post("/api/review/answer")
 async def judge_review_answer(request: ReviewAnswerRequest, user: AuthUser = Depends(current_user)):
-    """提交复习题答案并自动判分。
-
-    单选题按选项标签或完整选项匹配；填空题按 accepted_answers 匹配；其他开放题按关键点覆盖情况粗略判断。
-    """
     assert_user_access(request.user_id, user)
     session = review_store.get(request.user_id, request.session_id)
     if not session:
@@ -1436,7 +1540,6 @@ async def judge_review_answer(request: ReviewAnswerRequest, user: AuthUser = Dep
 
 @app.post("/api/review/complete")
 async def complete_review(request: ReviewCompleteRequest, user: AuthUser = Depends(current_user)):
-    """完成一套复习题，并根据答题结果更新试卷状态和学习画像薄弱度。"""
     assert_user_access(request.user_id, user)
     session = review_store.get(request.user_id, request.session_id)
     if not session:
@@ -1501,17 +1604,15 @@ async def complete_review(request: ReviewCompleteRequest, user: AuthUser = Depen
 
 @app.post("/api/profile/{user_id}/weakness/update")
 async def update_profile_weakness(user_id: str, request: WeaknessUpdateRequest, user: AuthUser = Depends(current_user)):
-    """手动调整某个概念的薄弱度，支持前端做“标记/取消薄弱点”等操作。"""
     assert_user_access(user_id, user)
     profile = profile_store.load(user_id)
     profile = adjust_concept_weakness(profile, request.concept, request.delta, request.reason)
     profile = profile_store.save(user_id, profile)
     return {"profile": profile}
 
-
 @app.delete("/api/files/{filename}")
 async def delete_file(filename: str, user: AuthUser = Depends(current_user)):
-    """删除用户个人知识库中的指定文件，并删除该文件关联的向量切片。"""
+    """删除知识库中的指定文件，并只删除该文件关联的向量切片"""
     file_path = safe_data_file(filename, user.id)
     
     try:
@@ -1524,37 +1625,32 @@ async def delete_file(filename: str, user: AuthUser = Depends(current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/ingest")
 async def trigger_ingest(user: AuthUser = Depends(current_user)):
-    """手动触发当前用户知识库重建。"""
+    """触发知识库重建"""
     try:
-        ingest_main(data_dir=data_dir_for_user(user.id), user_id=user.id)
+        await asyncio.to_thread(ingest_main, data_dir_for_user(user.id), user.id)
         return {"message": "知识库重建成功！"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# -----------------------------
-# 核心 RAG 问答接口
-# -----------------------------
 @app.post("/api/query")
 async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(current_user)):
-    """核心问答接口：执行 RAG 检索增强生成，并同步更新用户学习画像。
+    return await asyncio.to_thread(_query_knowledge_base_blocking, request, user)
 
-    主流程：
-    1. 校验用户和模型；
-    2. 根据历史对话重写当前问题，使其变成独立问题；
-    3. 抽取核心知识点并构造检索 query；
-    4. 在系统知识库、个人知识库和用户长期记忆中检索相关内容；
-    5. 把检索片段、长期记忆和短期历史拼接进 prompt；
-    6. 调用大模型生成回答与推荐追问；
-    7. 提取可长期记忆的信息，并更新学习画像。
-    """
+
+def _query_knowledge_base_blocking(request: QueryRequest, user: AuthUser):
+    """提问并返回答案、关联的分块信息"""
     assert_user_access(request.user_id, user)
-    chat_model = (request.chat_model or settings.chat_model).strip()
-    if not is_allowed_chat_model(chat_model):
-        raise HTTPException(status_code=400, detail=f"不支持的聊天模型：{chat_model}")
+    chat_model, user_settings, custom_config = resolve_chat_options(
+        user.id,
+        request.chat_model,
+        custom_model_enabled=request.custom_model_enabled,
+        custom_module="chat",
+    )
+    if request.deepseek_thinking_enabled is not None:
+        user_settings = {**user_settings, "deepseek_thinking_enabled": request.deepseek_thinking_enabled}
+    top_k = query_top_k(request, user_settings)
 
     ollama = OllamaClient()
     try:
@@ -1562,7 +1658,7 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
     except Exception:
         raise HTTPException(status_code=503, detail="Ollama 未启动或不可用")
 
-    # 1. 查询重写：如果用户问题依赖上一轮上下文，则先改写成独立问题，提升后续检索准确率。
+    # 1. 结合历史记录进行查询重写 (Query Rewriting)
     standalone_query = request.question
     if request.history:
         rewrite_prompt = f"Given the following conversation history and the latest user question, rewrite the latest user question to be a standalone query that can be understood without the conversation history. Do NOT answer the question, just rewrite it.\n\nHistory:\n"
@@ -1570,32 +1666,48 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
             rewrite_prompt += f"{msg.role}: {msg.content}\n"
         rewrite_prompt += f"\nLatest question: {request.question}\nStandalone query:"
         
-        rewritten = ollama.chat([{"role": "user", "content": rewrite_prompt}], model=chat_model)
+        rewritten = chat_with_options(
+            ollama,
+            [{"role": "user", "content": rewrite_prompt}],
+            chat_model,
+            user_settings,
+            custom_config,
+        )
         if rewritten and len(rewritten.strip()) > 0:
             standalone_query = rewritten.strip()
 
-    # 2. 关键词增强：抽取核心知识点后拼接到检索文本中，让 embedding 更关注专业术语。
-    core_terms = extract_core_terms(ollama, standalone_query, model=chat_model)
+    # 2. 提取核心知识点，强化用于向量检索的查询文本
+    core_terms = extract_core_terms(ollama, standalone_query, model=chat_model, user_settings=user_settings, custom_config=custom_config)
     retrieval_query = build_retrieval_query(standalone_query, core_terms)
     query_embedding = ollama.embed([retrieval_query])[0]
     
-    # 2.1 双路检索：同时检索系统公共知识库和当前用户个人知识库。
+    # 2.1 双路检索：通用知识库 + 用户私有长期记忆库
     from app.query import candidate_count, diverse_results
     documents: list[str] = []
     metadatas: list[dict] = []
     distances: list[float] = []
-    for scope, collection in (
-        ("system", get_collection(reset=False)),
-        ("personal", get_collection(reset=False, user_id=user.id)),
-    ):
+    search_scope = request.search_scope or str(user_settings.get("search_scope") or "all")
+    selected_files = request.selected_files if request.selected_files else user_settings.get("selected_files", [])
+    scope_collections = []
+    if search_scope in {"all", "system"}:
+        scope_collections.append(("system", get_collection(reset=False)))
+    if search_scope in {"all", "personal"}:
+        scope_collections.append(("personal", get_collection(reset=False, user_id=user.id)))
+
+    for scope, collection in scope_collections:
         try:
+            source_filter = chroma_source_filter(selected_sources_for_scope(selected_files, scope))
+            query_args: dict[str, Any] = {
+                "query_embeddings": [query_embedding],
+                "n_results": candidate_count(top_k),
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if source_filter:
+                query_args["where"] = source_filter
             result = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=candidate_count(settings.top_k),
-                include=["documents", "metadatas", "distances"],
+                **query_args,
             )
         except Exception:
-            # 某个知识库暂不可用时跳过该路检索，避免整个问答接口直接失败。
             continue
         scope_docs = (result.get("documents") or [[]])[0]
         scope_metas = (result.get("metadatas") or [[]])[0]
@@ -1607,7 +1719,6 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
         metadatas.extend(scope_metas)
         distances.extend(scope_distances)
 
-    # ChromaDB 距离越小通常表示越相关；先统一排序，再做多样性筛选，避免同一来源连续片段过度集中。
     combined = sorted(zip(documents, metadatas, distances), key=lambda item: item[2])
     documents = [item[0] for item in combined]
     metadatas = [item[1] for item in combined]
@@ -1616,19 +1727,19 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
         documents,
         metadatas,
         distances,
-        top_k=settings.top_k,
+        top_k=top_k,
         neighbor_window=3,
         per_source_limit=2,
     )
 
-    # 2.2 检索用户长期记忆：用于补充个性化偏好、历史学习状态等非教材信息。
+    # 2.2 检索用户长期记忆 (Long-term memory)
     user_mem_collection = get_user_memory_collection(request.user_id, reset=False)
     user_mem_docs = []
     all_user_memories = get_all_user_memories(user_mem_collection)
     if user_mem_collection.count() > 0:
         mem_result = user_mem_collection.query(
             query_embeddings=[query_embedding],
-            n_results=2,  # 取最多 2 条相关记忆，避免个性化信息压过课程知识。
+            n_results=2, # 取最多2条相关记忆
             include=["documents", "metadatas", "distances"],
         )
         user_mem_docs = (mem_result.get("documents") or [[]])[0]
@@ -1644,37 +1755,44 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
             "profile": current_profile,
         }
 
-    # 3. 构造大模型上下文：把检索文档、长期记忆和短期对话历史组合成最终 messages。
+    # 3. 构造大模型上下文 (整合文档、记忆和历史)
     from app.query import build_context, SYSTEM_PROMPT
     context = build_context(documents, metadatas)
     
-    # 将用户长期记忆以独立区域追加到 prompt 中，帮助模型做个性化表达。
+    # 补充个人记忆提示
     if user_mem_docs:
         context += "\n\n[User Specific Long-Term Memories]\n" + "\n".join(user_mem_docs)
 
+    # 包含历史的消息链拼接
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     
-    # 短期记忆：保留最近对话历史，使模型能延续上下文。
+    # 放入最近对话历史 (短期记忆)
     for msg in request.history:
         messages.append({"role": normalize_chat_role(msg.role), "content": msg.content})
         
     user_prompt = f"Context:\n{context}\n\nQuestion:\n{request.question}"
     messages.append({"role": "user", "content": user_prompt})
     
-    # 4. 调用大模型生成最终回答，并额外生成或修复推荐追问。
-    answer = ollama.chat(messages=messages, model=chat_model)
+    answer = chat_with_options(ollama, messages, chat_model, user_settings, custom_config)
     answer_body, followups, extracted_followups = split_answer_and_followups(answer, request.question)
-    followups = generate_followups(ollama, request.question, answer_body, core_terms, model=chat_model)
+    followups = generate_followups(ollama, request.question, answer_body, core_terms, model=chat_model, user_settings=user_settings, custom_config=custom_config)
     if len(followups) < 3:
-        followups = repair_followups(ollama, request.question, answer_body, core_terms, followups, model=chat_model)
+        followups = repair_followups(ollama, request.question, answer_body, core_terms, followups, model=chat_model, user_settings=user_settings, custom_config=custom_config)
     if len(followups) < 3:
         fallback = default_followups(request.question, core_terms)
         followups.extend(fallback[len(followups):])
     followups = followups[:3]
 
-    # 5. 提取并更新本轮长期记忆：只保存稳定的用户偏好、事实或学习特征。
+    # 4. 后台提取并更新本轮长期记忆 (落入 ChromaDB)
+    # 用一个极简的 prompt 让 LLM 判断是否有值得长期记住的事实
     extract_prompt = f"Extract a brief single sentence of a persistent user preference, fact or characteristic from the following dialogue, if any. If there is no specific user fact to remember, reply with 'NONE'.\nUser: {request.question}\nAssistant: {answer_body}"
-    extracted_mem = ollama.chat([{"role": "user", "content": extract_prompt}], model=chat_model)
+    extracted_mem = chat_with_options(
+        ollama,
+        [{"role": "user", "content": extract_prompt}],
+        chat_model,
+        user_settings,
+        custom_config,
+    )
     if extracted_mem and "NONE" not in extracted_mem.upper() and len(extracted_mem) > 5:
         import uuid
         mem_embed = ollama.embed([extracted_mem])[0]
@@ -1685,7 +1803,7 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
             metadatas=[{"source": "conversation_memory"}]
         )
 
-    # 6. 整理检索命中的知识片段，返回给前端用于展示引用来源、页码和相似度距离。
+    # 整理反馈给前端的内容块列表
     chunks = []
     for doc, meta, dist in zip(documents, metadatas, distances):
         chunks.append({
@@ -1696,7 +1814,6 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
             "text": doc
         })
 
-    # 7. 分析本轮学习状态，并写回学习画像。
     current_profile = profile_store.load(request.user_id)
     learning_insight = analyze_learning_state(
         ollama,
@@ -1707,6 +1824,8 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
         user_memories=all_user_memories,
         profile=current_profile,
         model=chat_model,
+        deepseek_thinking_enabled=get_deepseek_thinking(user_settings, chat_model),
+        custom_openai=custom_config,
     )
     updated_profile = update_learning_profile(current_profile, learning_insight, question=request.question)
     updated_profile["abstract_evaluation"] = generate_abstract_evaluation(
@@ -1714,6 +1833,8 @@ async def query_knowledge_base(request: QueryRequest, user: AuthUser = Depends(c
         profile=updated_profile,
         question=request.question,
         model=chat_model,
+        user_settings=user_settings,
+        custom_config=custom_config,
     )
     updated_profile = profile_store.save(request.user_id, updated_profile)
 

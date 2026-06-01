@@ -5,8 +5,7 @@
         <div>
           <h1>知识库</h1>
           <p>系统知识库只读；我的知识库支持上传、删除和检索。</p>
-          <p v-if="dataDir" class="muted">当前目录：{{ dataDir }}</p>
-          <p v-if="systemDataDir" class="muted">系统目录：{{ systemDataDir }}</p>
+          <p class="muted">PDF 文件首次预览需要加载解析资源，较大的文件可能较慢，请耐心等待。</p>
         </div>
         <RouterLink class="button ghost" to="/chat">返回问答</RouterLink>
       </div>
@@ -60,8 +59,6 @@ const personalFiles = ref<string[]>([]);
 const selected = ref<SelectedFile | null>(null);
 const ingesting = ref(false);
 const error = ref('');
-const dataDir = ref('');
-const systemDataDir = ref('');
 
 async function load() {
   error.value = '';
@@ -69,8 +66,6 @@ async function load() {
     const data = await api.files();
     personalFiles.value = data.personal_files || data.files || [];
     systemFiles.value = data.system_files || [];
-    dataDir.value = (data as any).data_dir || '';
-    systemDataDir.value = (data as any).system_data_dir || '';
   } catch (e: any) {
     personalFiles.value = [];
     systemFiles.value = [];

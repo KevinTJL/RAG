@@ -110,6 +110,8 @@ def analyze_learning_state(
     user_memories: list[str],
     profile: dict[str, Any],
     model: str | None = None,
+    deepseek_thinking_enabled: bool | None = None,
+    custom_openai: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     chunk_preview = [
         {
@@ -169,6 +171,12 @@ JSON格式：
 
 JSON对象："""
 
-    response = ollama.chat([{"role": "user", "content": prompt}], model=model, temperature=0.1)
+    response = ollama.chat(
+        [{"role": "user", "content": prompt}],
+        model=model,
+        temperature=0.1,
+        deepseek_thinking_enabled=deepseek_thinking_enabled,
+        custom_openai=custom_openai,
+    )
     data = extract_json_object(response)
     return normalize_analysis(data, core_terms)

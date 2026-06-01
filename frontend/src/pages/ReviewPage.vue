@@ -137,6 +137,7 @@ import { computed, nextTick, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
 import { api, getUserId } from '../api';
 import { chatStore } from '../chatStore';
+import { settingsStore } from '../settingsStore';
 import MarkdownView from '../components/MarkdownView.vue';
 import ProfilePanel from '../components/ProfilePanel.vue';
 
@@ -169,6 +170,15 @@ const chatModels = chatStore.chatModels;
 const selectedChatModel = chatStore.selectedChatModel;
 const setSelectedChatModel = chatStore.setSelectedChatModel;
 const activeHistory = computed(() => history.value.filter((item) => item.status !== 'completed'));
+
+function reviewModelOptions() {
+  const options = settingsStore.reviewQueryOptions();
+  const customName = settingsStore.settings.value.custom_openai.model_name;
+  return {
+    ...options,
+    chat_model: options.custom_model_enabled && customName ? `custom-openai:${customName}` : selectedChatModel.value,
+  };
+}
 
 async function loadHistory() {
   history.value = (await api.reviewHistory(userId)).sessions;
@@ -294,7 +304,7 @@ async function createPlan() {
       weak_score: weakScore,
       difficulty: clampDifficulty(selectedDifficulty.value),
       mode: 'topic',
-      chat_model: selectedChatModel.value,
+      ...reviewModelOptions(),
     })).session;
     restoreSession(created);
     await loadHistory();
@@ -324,7 +334,7 @@ async function createPlanFor(item: any) {
       weak_score: score,
       difficulty: clampDifficulty(selectedDifficulty.value),
       mode: 'topic',
-      chat_model: selectedChatModel.value,
+      ...reviewModelOptions(),
     })).session;
     restoreSession(created);
     await loadHistory();
@@ -399,7 +409,7 @@ async function submitPaper() {
       weak_score: weakScore,
       difficulty: nextLevel,
       mode: 'topic',
-      chat_model: selectedChatModel.value,
+      ...reviewModelOptions(),
     })).session;
     restoreSession(created);
     await loadHistory();
@@ -429,7 +439,7 @@ async function createComprehensivePlan() {
       weak_score: 0,
       difficulty: clampDifficulty(selectedDifficulty.value),
       mode: 'comprehensive',
-      chat_model: selectedChatModel.value,
+      ...reviewModelOptions(),
     })).session;
     restoreSession(created);
     await loadHistory();

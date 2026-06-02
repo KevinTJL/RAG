@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from app.auth import AuthStore, AuthUser
 from app.config import settings
 from app.learning_analyzer import analyze_learning_state
-from app.learning_profile import adjust_concept_weakness, set_concept_weakness, update_learning_profile
+from app.learning_profile import WEAKNESS_UPDATE_STEP, adjust_concept_weakness, set_concept_weakness, update_learning_profile
 from app.ollama_client import OllamaClient
 from app.profile_store import ProfileStore, safe_user_id
 from app.review_store import ReviewStore, now_iso as review_now_iso
@@ -1565,11 +1565,14 @@ async def complete_review(request: ReviewCompleteRequest, user: AuthUser = Depen
 
     weakness_delta = 0.0
     if request.completed and result == "failed":
-        next_weakness = min(1.0, max(WEAKNESS_START_SCORE, current_weakness + 0.2 if is_existing_weak_practice else WEAKNESS_START_SCORE))
+        next_weakness = min(
+            1.0,
+            max(WEAKNESS_START_SCORE, current_weakness + WEAKNESS_UPDATE_STEP if is_existing_weak_practice else WEAKNESS_START_SCORE),
+        )
         weakness_delta = round(next_weakness - current_weakness, 2)
         profile = set_concept_weakness(profile, topic, next_weakness, "答卷不及格，标记为薄弱知识点")
     elif request.completed and is_existing_weak_practice and result == "excellent":
-        next_weakness = max(0.0, current_weakness - 0.2)
+        next_weakness = max(0.0, current_weakness - WEAKNESS_UPDATE_STEP)
         weakness_delta = round(next_weakness - current_weakness, 2)
         profile = set_concept_weakness(profile, topic, next_weakness, "答卷达到优秀，降低薄弱度")
     elif request.completed and is_existing_weak_practice and result == "passed":

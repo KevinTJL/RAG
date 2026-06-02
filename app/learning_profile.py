@@ -6,6 +6,9 @@ from typing import Any
 from app.profile_store import now_iso
 
 
+WEAKNESS_UPDATE_STEP = 0.2
+
+
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
@@ -184,18 +187,16 @@ def prune_cleared_items(profile: dict[str, Any]) -> None:
 
 def update_concept_weakness(profile: dict[str, Any], analysis: dict[str, Any]) -> None:
     mastery = profile.setdefault("concept_mastery", {})
-    concepts = as_list(analysis.get("core_concepts"))
+    concepts = {normalize_text(item) for item in as_list(analysis.get("core_concepts")) if normalize_text(item)}
     weak_concepts = analysis_weak_concepts(analysis)
 
-    for raw_concept in concepts:
-        concept = normalize_text(raw_concept)
-        if not concept:
-            continue
+    for concept in concepts | weak_concepts:
         current = mastery.get(concept, {})
         score = float(current.get("score", 0.0))
-        score -= 0.04
         if concept in weak_concepts:
-            score += 0.22
+            score += WEAKNESS_UPDATE_STEP
+        else:
+            score -= WEAKNESS_UPDATE_STEP
         score = clamp(score)
 
         status = "weak" if score >= 0.55 else ("learning" if score > 0 else "familiar")
@@ -203,17 +204,6 @@ def update_concept_weakness(profile: dict[str, Any], analysis: dict[str, Any]) -
             **current,
             "score": round(score, 2),
             "status": status,
-            "evidence_count": int(current.get("evidence_count", 0) or 0) + 1,
-            "last_seen": now_iso(),
-        }
-
-    for concept in weak_concepts:
-        current = mastery.get(concept, {})
-        score = clamp(float(current.get("score", 0.0)) + 0.18)
-        mastery[concept] = {
-            **current,
-            "score": round(score, 2),
-            "status": "weak" if score >= 0.55 else "learning",
             "evidence_count": int(current.get("evidence_count", 0) or 0) + 1,
             "last_seen": now_iso(),
         }
@@ -267,7 +257,8 @@ def adjust_concept_weakness(profile: dict[str, Any], concept: str, delta: float,
     concept_name = normalize_text(concept) or "未命名知识点"
     mastery = next_profile.setdefault("concept_mastery", {})
     current = mastery.get(concept_name, {})
-    score = clamp(float(current.get("score", 0.0)) + delta)
+    applied_delta = WEAKNESS_UPDATE_STEP if delta > 0 else (-WEAKNESS_UPDATE_STEP if delta < 0 else 0.0)
+    score = clamp(float(current.get("score", 0.0)) + applied_delta)
     status = "weak" if score >= 0.55 else ("learning" if score > 0 else "familiar")
 
     mastery[concept_name] = {
@@ -278,7 +269,7 @@ def adjust_concept_weakness(profile: dict[str, Any], concept: str, delta: float,
         "last_seen": now_iso(),
     }
 
-    if delta > 0:
+    if applied_delta > 0:
         update_weak_history(next_profile, {concept_name})
     elif score <= 0:
         history = as_list(next_profile.get("weak_history"))
@@ -307,7 +298,7 @@ def adjust_concept_weakness(profile: dict[str, Any], concept: str, delta: float,
             "created_at": now_iso(),
             "topic": concept_name,
             "summary": reason,
-            "weak_concepts": [concept_name] if delta > 0 else [],
+            "weak_concepts": [concept_name] if applied_delta > 0 else [],
         }
         next_profile["recent_insights"] = [insight, *as_list(next_profile.get("recent_insights"))][:10]
 

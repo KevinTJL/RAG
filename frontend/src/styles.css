@@ -79,8 +79,10 @@ textarea { min-height: 96px; width: 100%; resize: vertical; }
 .followups button, .citations button { background: #eff6ff; color: #1d4ed8; text-align: left; border: 1px solid #bfdbfe; }
 .citations button { background: #f8fafc; color: #334155; }
 .insight { margin-top: 12px; padding: 12px; background: #fffbeb; color: #92400e; border: 1px solid #fde68a; border-radius: 8px; }
-.profile-panel { min-height: 0; overflow-y: auto; position: relative; transition: width .2s; }
-.profile-panel > div { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 18px; min-height: calc(100vh - 48px); }
+.profile-panel { min-height: 0; height: 100%; overflow: hidden; position: relative; transition: width .2s; }
+.profile-card { height: 100%; min-height: calc(100vh - 48px); display: grid; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); background: white; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; box-shadow: 0 10px 30px rgba(15, 23, 42, .04); }
+.profile-avatar-slot { min-height: 0; border-bottom: 1px solid #f3f4f6; background: white; }
+.profile-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 18px; }
 .profile-panel h3 { font-size: 14px; color: #4b5563; margin: 20px 0 10px; }
 .cache-note { margin: -6px 0 12px; color: #9ca3af; font-size: 12px; }
 .profile-summary { background: #eef6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px; margin: 12px 0 16px; }
@@ -120,8 +122,9 @@ textarea { min-height: 96px; width: 100%; resize: vertical; }
 .review-main { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .review-side { min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; overflow: hidden; }
 .review-side-pane { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-.review-side-pane .profile-panel { overflow: visible; }
-.review-side-pane .profile-panel > div { min-height: 0; }
+.review-side > .review-side-pane:first-child { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.review-side-pane .profile-panel { min-height: 0; overflow: hidden; }
+.review-side-pane .profile-card { min-height: 0; }
 .review-form { display: grid; grid-template-columns: minmax(0, 1fr) 140px auto; gap: 10px; margin-bottom: 18px; }
 .plan-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .plan-meta span { padding: 5px 9px; border-radius: 999px; background: #eef2ff; color: #3730a3; font-size: 12px; font-weight: 700; }

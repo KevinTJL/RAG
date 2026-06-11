@@ -1,41 +1,44 @@
 <template>
   <aside class="profile-panel">
-    <div>
-      <div class="panel-head">
-        <h2>学习画像</h2>
-        <button :disabled="loading" @click="$emit('refresh')">{{ loading ? '同步中...' : '刷新' }}</button>
-      </div>
-      <p v-if="cachedAt" class="cache-note">缓存于 {{ cacheTime }}</p>
-      <div v-if="error" class="error small">{{ error }}</div>
-      <div v-if="!profile" class="empty">暂无缓存画像</div>
-      <template v-else>
-        <section class="profile-summary">
-          <span>抽象评价</span>
-          <p>{{ abstractEvaluation }}</p>
-        </section>
-
-        <h3>薄弱概念</h3>
-        <div v-if="weakConcepts.length === 0" class="empty small">暂无明显薄弱点</div>
-        <button v-for="item in weakConcepts" :key="item.name" class="weak-row" @click="$emit('review', item)">
-          <span class="pie" :style="{ background: pie(item.score) }"></span>
-          <span>{{ item.name }}</span>
-          <b>{{ Math.round(item.score * 100) }}%</b>
-          <span class="delete-mini" @click.stop="$emit('delete-tag', { category: 'concept_mastery', value: item.name })">删除</span>
-        </button>
-
-        <h3>学习模块</h3>
-        <button v-for="item in reviews" :key="item" class="review-link" @click="$emit('review', { name: item, score: 0.4 })">
-          <span>{{ item }}</span>
-          <span class="delete-mini" @click.stop="$emit('delete-tag', { category: 'recommended_review', value: item })">删除</span>
-        </button>
-
-        <h3>薄弱历史</h3>
-        <div v-for="item in history" :key="item.concept" class="history-row">
-          <span>{{ item.concept }}</span>
-          <em>{{ item.status === 'cleared' ? '已熟悉' : '进行中' }}</em>
-          <button class="text-delete" @click="$emit('delete-tag', { category: 'weak_history', value: item.concept })">删除</button>
+    <div class="profile-card">
+      <div class="profile-avatar-slot" aria-hidden="true"></div>
+      <section class="profile-content">
+        <div class="panel-head">
+          <h2>学习画像</h2>
+          <button :disabled="loading" @click="$emit('refresh')">{{ loading ? '同步中...' : '刷新' }}</button>
         </div>
-      </template>
+        <p v-if="cachedAt" class="cache-note">缓存于 {{ cacheTime }}</p>
+        <div v-if="error" class="error small">{{ error }}</div>
+        <div v-if="!profile" class="empty">暂无缓存画像</div>
+        <template v-else>
+          <section class="profile-summary">
+            <span>抽象评价</span>
+            <p>{{ abstractEvaluation }}</p>
+          </section>
+
+          <h3>薄弱概念</h3>
+          <div v-if="weakConcepts.length === 0" class="empty small">暂无明显薄弱点</div>
+          <button v-for="item in weakConcepts" :key="item.name" class="weak-row" @click="$emit('review', item)">
+            <span class="pie" :style="{ background: pie(item.score) }"></span>
+            <span>{{ item.name }}</span>
+            <b>{{ Math.round(item.score * 100) }}%</b>
+            <span class="delete-mini" @click.stop="$emit('delete-tag', { category: 'concept_mastery', value: item.name })">删除</span>
+          </button>
+
+          <h3>学习模块</h3>
+          <button v-for="item in reviews" :key="item" class="review-link" @click="$emit('review', { name: item, score: 0.4 })">
+            <span>{{ item }}</span>
+            <span class="delete-mini" @click.stop="$emit('delete-tag', { category: 'recommended_review', value: item })">删除</span>
+          </button>
+
+          <h3>薄弱历史</h3>
+          <div v-for="item in history" :key="item.concept" class="history-row">
+            <span>{{ item.concept }}</span>
+            <em>{{ item.status === 'cleared' ? '已熟悉' : '进行中' }}</em>
+            <button class="text-delete" @click="$emit('delete-tag', { category: 'weak_history', value: item.concept })">删除</button>
+          </div>
+        </template>
+      </section>
     </div>
   </aside>
 </template>
